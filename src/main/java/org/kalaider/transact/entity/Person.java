@@ -5,6 +5,7 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.hibernate.annotations.GenericGenerator;
+import org.hibernate.annotations.OptimisticLocking;
 
 import javax.persistence.*;
 import java.util.UUID;
@@ -14,6 +15,7 @@ import java.util.UUID;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
+@OptimisticLocking
 public class Person {
 
     @GeneratedValue(generator = "uuid2")
@@ -33,4 +35,7 @@ public class Person {
     @Column(nullable = false)
     @Builder.Default
     private long balance = 0;
+
+    @Version
+    private long version;
 }

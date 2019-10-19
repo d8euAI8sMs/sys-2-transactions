@@ -19,4 +19,6 @@ public class AppProperties {
     }
     private Isolation isolation;
     private Effects desiredEffects;
+    private boolean freshCountSource;
+    private boolean mvcc;
 }

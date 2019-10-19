@@ -13,7 +13,13 @@ import org.springframework.boot.autoconfigure.cache.CacheAutoConfiguration;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Profile;
+import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.UnexpectedRollbackException;
+import org.springframework.transaction.support.TransactionCallback;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.persistence.EntityManager;
@@ -21,7 +27,9 @@ import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @SpringBootApplication(exclude = CacheAutoConfiguration.class)
 @EnableConfigurationProperties(AppProperties.class)
@@ -147,6 +155,83 @@ public class Application {
         };
     }
 
+    @Bean
+    @Profile({ "debit-1", "debit-2" })
+    public CommandLineRunner debitRunner() {
+        return args -> {
+            log.info("Hello from debit!");
+
+            transaction.setIsolationLevel(chooseIsolation(properties.getIsolation()));
+            transaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+            // generate some initial set of person and
+            // acquire some useful information
+            long count = transaction.execute(t -> {
+                final long desiredCount = 10;
+                final long cnt = repository.count();
+                if (cnt < desiredCount) {
+                    Stream.generate(() -> Person.builder().mood(Mood.GOOD).name("Debit").build())
+                            .limit(desiredCount - cnt).forEach(repository::save);
+                }
+                return Math.max(desiredCount, cnt);
+            });
+
+            Supplier<Long> countSource = () -> {
+                if (properties.isFreshCountSource()) return repository.count();
+                return count;
+            };
+
+            // without any delay
+            while (!Thread.currentThread().isInterrupted()) {
+                final int batch = 10;
+                long [] timings = new long[3];
+                for (int j = 0; j < 10; ++j) {
+                    long [] timings0 = profilingInTransaction(t -> {
+                        ThreadLocalRandom r = ThreadLocalRandom.current();
+                        int minParticipants = 3;
+                        int maxParticipants = 7;
+                        int participants = r.nextInt(minParticipants, maxParticipants + 1);
+                        long cnt = countSource.get();
+                        long blocks = (cnt + participants / 2) / participants; // ceiling
+                        long block = r.nextLong(0, blocks);
+
+                        Page<Person> all = repository.findAll(PageRequest.of((int)block, participants));
+
+                        // mutual random debit/credit operations
+                        try {
+                            all.forEach(p1 -> all.forEach(p2 -> {
+                                if (p1 == p2) return;
+                                long minVal = 1, maxVal = 100;
+                                long val = r.nextLong(minVal, maxVal);
+                                p1.setBalance(p1.getBalance() - val);
+                                p2.setBalance(p2.getBalance() + val);
+                                repository.saveAndFlush(p1);
+                                repository.saveAndFlush(p2);
+                            }));
+                        } catch (ObjectOptimisticLockingFailureException ex) {
+                            log.error("concurrent modification detected, rolling back");
+                        }
+
+                        return null;
+                    });
+                    if (timings0 != null) {
+                        timings[0] += timings0[0];
+                        timings[1] += timings0[1];
+                        timings[2] += timings0[2];
+                    }
+                }
+
+                log.info("elapsed time:              {}", Duration.ofNanos(timings[0] + timings[1] + timings[2]));
+                log.info("  - lock acquisition time: {}", Duration.ofNanos(timings[0]));
+                log.info("  - transaction duration:  {}", Duration.ofNanos(timings[1]));
+                log.info("  - commit time:           {}", Duration.ofNanos(timings[2]));
+
+                long balanceInvariant = transaction.execute(t -> repository.totalBalance());
+                log.info("total balance is: {}", balanceInvariant);
+            }
+        };
+    }
+
     private boolean checkForDirtyReads(Map<UUID, Person> p1, Map<UUID, Person> p2) {
         return p1.values().stream().allMatch(p ->
             Optional.ofNullable(p2.get(p.getId()))
@@ -176,5 +261,34 @@ public class Application {
         } catch (InterruptedException e) {
             return false;
         }
+    }
+
+    private <T> long[] profilingInTransaction(TransactionCallback<T> cb) {
+        final Duration idle = Duration.ofMillis(100);
+        long before = System.nanoTime();
+        long[] timings;
+        try {
+             timings = transaction.execute(t -> {
+                long init = System.nanoTime();
+                try {
+                    cb.doInTransaction(t);
+                } catch (CannotAcquireLockException ex) {
+                    log.error("deadlock detected");
+                    return null;
+                }
+                long dispose = System.nanoTime();
+                delay(idle);
+                return new long[] { init, dispose };
+            });
+        } catch (UnexpectedRollbackException ex) {
+            return null;
+        }
+        if (timings == null) return null;
+        long after = System.nanoTime();
+        return new long[] {
+                timings[0] - before,
+                timings[1] - timings[0],
+                after - timings[1] - idle.toNanos()
+        };
     }
 }
